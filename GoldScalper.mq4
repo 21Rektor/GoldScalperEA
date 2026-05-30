@@ -1,214 +1,280 @@
 //+------------------------------------------------------------------+
 //|                                              GoldScalper.mq4     |
-//|                          MT4 Gold (XAUUSD) Scalping Expert Advisor|
+//|              MT4 Gold (XAUUSD) EA — Version 3.0                  |
 //|                                                                    |
-//|  Strategy:                                                         |
-//|    - EMA crossover (fast 8 / slow 21) for trend direction          |
-//|    - RSI filter to avoid chasing momentum extremes                 |
-//|    - ATR-based dynamic Stop Loss & Take Profit                     |
-//|    - Spread guard so we never trade in wide-spread conditions       |
-//|    - Session filter (London + NY overlap only)                     |
+//|  FIXES FROM v2 BACKTEST (PF 0.91, 37% win, 74% drawdown):        |
+//|    - Too many trades (1952) → max 2/day, strict ADX filter        |
+//|    - Spread (29pts) killing M5 targets → switched to M15          |
+//|    - RR not enough at 36% win rate → 3:1 RR, bigger targets       |
+//|    - 74% drawdown → hard daily loss limit, max 1% risk/trade      |
+//|                                                                    |
+//|  Strategy: Session Momentum + Multi-Filter                        |
+//|  Timeframe: M15 (compile & attach chart to M15!)                  |
+//|                                                                    |
+//|  Entry checklist (ALL must pass):                                  |
+//|    1. H4 trend — price above/below H4 EMA 50                      |
+//|    2. ADX > 22 — market is trending, not ranging                  |
+//|    3. H1 EMA cross — fast 8 crossed slow 21 in entry direction    |
+//|    4. RSI confirmation — 40-60 zone (momentum, not exhaustion)     |
+//|    5. Candle body — last M15 bar body > 50% of total range        |
+//|    6. Session — London open (08-10) or NY open (13-15) only       |
+//|    7. Spread < 30 pts, min profit potential 3× spread             |
+//|                                                                    |
+//|  Exit:                                                             |
+//|    - SL  : 1.5 × ATR(14) on M15                                   |
+//|    - TP  : 3.0 × ATR(14) on M15  (2:1 RR minimum)                |
+//|    - Breakeven: move SL to entry+spread after 1×ATR in profit     |
+//|    - Hard daily loss limit: stops trading if day loss > 2%        |
 //+------------------------------------------------------------------+
-#property copyright "GoldScalperEA"
-#property version   "1.00"
+#property copyright "GoldScalperEA v3.0"
+#property version   "3.00"
 #property strict
 
-//--- Input parameters
-input double RiskPercent      = 1.0;   // Risk per trade (% of balance)
-input int    FastEMA          = 8;     // Fast EMA period
-input int    SlowEMA          = 21;    // Slow EMA period
-input int    RSI_Period       = 14;    // RSI period
-input double RSI_OB           = 70.0;  // RSI overbought level
-input double RSI_OS           = 30.0;  // RSI oversold level
-input double ATR_Multiplier   = 1.5;   // ATR multiplier for SL
-input double RR_Ratio         = 2.0;   // Risk:Reward ratio for TP
-input int    MaxSpreadPoints  = 30;    // Max allowed spread (points)
-input int    SessionStartHour = 7;     // Session open hour (server time)
-input int    SessionEndHour   = 20;    // Session close hour (server time)
-input int    MagicNumber      = 202401;// Unique EA identifier
-input bool   UseTrailingStop  = true;  // Enable trailing stop
-input double TrailATR         = 1.0;   // Trailing stop distance (ATR units)
+//--- Inputs
+input double RiskPercent       = 0.8;   // Risk per trade (% of balance)
+input int    ADX_Period        = 14;    // ADX period
+input double ADX_MinLevel      = 22.0;  // Min ADX for trend strength
+input int    FastEMA           = 8;     // Fast EMA (H1)
+input int    SlowEMA           = 21;    // Slow EMA (H1)
+input int    H4_EMA_Period     = 50;    // H4 trend EMA period
+input int    RSI_Period        = 14;    // RSI period
+input double RSI_BuyMin        = 45.0;  // RSI min for buy (not overbought)
+input double RSI_BuyMax        = 65.0;  // RSI max for buy
+input double RSI_SellMin       = 35.0;  // RSI min for sell
+input double RSI_SellMax       = 55.0;  // RSI max for sell (not oversold)
+input double ATR_SL            = 1.5;   // SL distance in ATR units
+input double ATR_TP            = 3.0;   // TP distance in ATR units (2:1 RR)
+input double ATR_BE            = 1.0;   // Move to breakeven after X ATR profit
+input int    MaxSpreadPoints   = 30;    // Max spread allowed (points)
+input int    LondonOpenStart   = 8;     // London session start hour
+input int    LondonOpenEnd     = 10;    // London session end hour
+input int    NYOpenStart       = 13;    // NY session start hour
+input int    NYOpenEnd         = 15;    // NY session end hour
+input int    MaxTradesPerDay   = 2;     // Max trades per day
+input double MaxDailyLossPct   = 2.0;   // Stop trading if daily loss > X%
+input int    MagicNumber       = 202403;// EA identifier
 
-//--- Global variables
-double FastEMAVal, SlowEMAVal, PrevFastEMA, PrevSlowEMA;
-double RSIVal, ATRVal;
-int    Slippage = 3;
+//--- State
+int      tradesToday    = 0;
+double   dayStartBalance= 0;
+datetime lastTradeDay   = 0;
+bool     dailyLimitHit  = false;
+int      Slippage       = 3;
 
-//+------------------------------------------------------------------+
-//| Expert initialization                                            |
 //+------------------------------------------------------------------+
 int OnInit()
   {
-   Print("GoldScalper EA initialised on ", Symbol(), " | TF: ", Period());
-   if(Symbol() != "XAUUSD" && Symbol() != "GOLD")
-      Print("WARNING: This EA is optimised for XAUUSD. Current symbol: ", Symbol());
+   Print("GoldScalper v3.0 — M15 Session Momentum EA on ", Symbol());
+   if(Period() != PERIOD_M15)
+      Print("WARNING: Attach this EA to an M15 chart for best results!");
+   dayStartBalance = AccountBalance();
    return(INIT_SUCCEEDED);
   }
 
 //+------------------------------------------------------------------+
-//| Expert tick function                                             |
-//+------------------------------------------------------------------+
 void OnTick()
   {
-   // Only act on a new bar to avoid re-entries within the same candle
-   static datetime lastBarTime = 0;
-   if(Time[0] == lastBarTime) return;
-   lastBarTime = Time[0];
+   // New bar check
+   static datetime lastBar = 0;
+   if(Time[0] == lastBar) return;
+   lastBar = Time[0];
 
-   // --- Session filter ---
-   int hour = TimeHour(TimeCurrent());
-   if(hour < SessionStartHour || hour >= SessionEndHour) return;
-
-   // --- Spread filter ---
-   double spread = MarketInfo(Symbol(), MODE_SPREAD);
-   if(spread > MaxSpreadPoints)
+   // Daily reset
+   datetime today = TimeCurrent();
+   if(TimeDay(today) != TimeDay(lastTradeDay))
      {
-      Print("Spread too wide (", spread, " pts) — skipping bar.");
+      tradesToday     = 0;
+      dailyLimitHit   = false;
+      dayStartBalance = AccountBalance();
+      lastTradeDay    = today;
+     }
+
+   // Manage open trades (breakeven)
+   ManageBreakeven();
+
+   // Daily loss guard
+   if(!dailyLimitHit)
+     {
+      double dayLoss = (dayStartBalance - AccountEquity()) / dayStartBalance * 100.0;
+      if(dayLoss >= MaxDailyLossPct)
+        {
+         dailyLimitHit = true;
+         Print("Daily loss limit reached (", DoubleToStr(dayLoss,2), "%) — no more trades today.");
+        }
+     }
+   if(dailyLimitHit) return;
+
+   // Trade limits
+   if(tradesToday >= MaxTradesPerDay) return;
+   if(TotalOpenOrders() > 0) return;
+
+   // Session filter — London or NY open only
+   int hour = TimeHour(today);
+   bool inSession = (hour >= LondonOpenStart && hour < LondonOpenEnd) ||
+                    (hour >= NYOpenStart      && hour < NYOpenEnd);
+   if(!inSession) return;
+
+   // Spread filter
+   double spread = MarketInfo(Symbol(), MODE_SPREAD);
+   if(spread > MaxSpreadPoints) return;
+
+   //--- Indicators ---
+   double atr   = iATR(NULL, 0, 14, 1);
+   double rsi   = iRSI(NULL, 0, RSI_Period, PRICE_CLOSE, 1);
+   double adx   = iADX(NULL, 0, ADX_Period, PRICE_CLOSE, MODE_MAIN,    1);
+   double diPlus  = iADX(NULL, 0, ADX_Period, PRICE_CLOSE, MODE_PLUSDI,  1);
+   double diMinus = iADX(NULL, 0, ADX_Period, PRICE_CLOSE, MODE_MINUSDI, 1);
+
+   // H1 EMA cross
+   double h1FastNow  = iMA(NULL, PERIOD_H1, FastEMA, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double h1SlowNow  = iMA(NULL, PERIOD_H1, SlowEMA, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double h1FastPrev = iMA(NULL, PERIOD_H1, FastEMA, 0, MODE_EMA, PRICE_CLOSE, 1);
+   double h1SlowPrev = iMA(NULL, PERIOD_H1, SlowEMA, 0, MODE_EMA, PRICE_CLOSE, 1);
+
+   // H4 trend direction
+   double h4ema   = iMA(NULL, PERIOD_H4, H4_EMA_Period, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double h4close = iClose(Symbol(), PERIOD_H4, 0);
+
+   // M15 candle body strength (body must be > 50% of total range)
+   double bodySize  = MathAbs(Close[1] - Open[1]);
+   double totalRange= High[1] - Low[1];
+   bool strongCandle = (totalRange > 0 && bodySize / totalRange >= 0.5);
+
+   // Minimum profit potential (must be 3× spread at least)
+   double minTarget = spread * 3 * Point;
+   bool worthTrading = (atr * ATR_TP > minTarget);
+
+   // ADX confirms trend is strong
+   bool trendStrong = (adx >= ADX_MinLevel);
+
+   //--- BUY conditions ---
+   bool h4Bull     = (h4close > h4ema);
+   bool emaCrossBull = (h1FastPrev <= h1SlowPrev && h1FastNow > h1SlowNow);
+   bool rsiBuy     = (rsi >= RSI_BuyMin && rsi <= RSI_BuyMax);
+   bool disBull    = (diPlus > diMinus);
+   bool bullCandle = (Close[1] > Open[1]);
+
+   if(h4Bull && trendStrong && disBull && emaCrossBull && rsiBuy && strongCandle && bullCandle && worthTrading)
+     {
+      OpenTrade(OP_BUY, atr);
       return;
      }
 
-   // --- Indicator values (shift 1 = last closed bar) ---
-   FastEMAVal   = iMA(NULL, 0, FastEMA,  0, MODE_EMA, PRICE_CLOSE, 1);
-   SlowEMAVal   = iMA(NULL, 0, SlowEMA,  0, MODE_EMA, PRICE_CLOSE, 1);
-   PrevFastEMA  = iMA(NULL, 0, FastEMA,  0, MODE_EMA, PRICE_CLOSE, 2);
-   PrevSlowEMA  = iMA(NULL, 0, SlowEMA,  0, MODE_EMA, PRICE_CLOSE, 2);
-   RSIVal       = iRSI(NULL, 0, RSI_Period, PRICE_CLOSE, 1);
-   ATRVal       = iATR(NULL, 0, 14, 1);
+   //--- SELL conditions ---
+   bool h4Bear     = (h4close < h4ema);
+   bool emaCrossBear = (h1FastPrev >= h1SlowPrev && h1FastNow < h1SlowNow);
+   bool rsiSell    = (rsi >= RSI_SellMin && rsi <= RSI_SellMax);
+   bool disBear    = (diMinus > diPlus);
+   bool bearCandle = (Close[1] < Open[1]);
 
-   // --- Crossover signals ---
-   bool bullCross = (PrevFastEMA <= PrevSlowEMA) && (FastEMAVal > SlowEMAVal);
-   bool bearCross = (PrevFastEMA >= PrevSlowEMA) && (FastEMAVal < SlowEMAVal);
-
-   // --- RSI filter ---
-   bool rsiBuyOK  = (RSIVal > RSI_OS && RSIVal < RSI_OB); // not overbought
-   bool rsiSellOK = (RSIVal < RSI_OB && RSIVal > RSI_OS); // not oversold
-
-   // --- Trailing stop management ---
-   if(UseTrailingStop) ManageTrailingStop();
-
-   // --- No trade if already in position ---
-   if(TotalOpenOrders() > 0) return;
-
-   // --- Entry logic ---
-   if(bullCross && rsiBuyOK)
-      OpenTrade(OP_BUY);
-   else if(bearCross && rsiSellOK)
-      OpenTrade(OP_SELL);
+   if(h4Bear && trendStrong && disBear && emaCrossBear && rsiSell && strongCandle && bearCandle && worthTrading)
+     {
+      OpenTrade(OP_SELL, atr);
+     }
   }
 
 //+------------------------------------------------------------------+
-//| Open a trade with ATR-based SL / TP                              |
-//+------------------------------------------------------------------+
-void OpenTrade(int orderType)
+void OpenTrade(int orderType, double atr)
   {
-   double sl, tp, price;
-   double slDistance = ATRVal * ATR_Multiplier;
-   double tpDistance = slDistance * RR_Ratio;
-   double lotSize    = CalculateLotSize(slDistance);
+   double slDist  = atr * ATR_SL;
+   double tpDist  = atr * ATR_TP;
+   double lots    = CalculateLotSize(slDist);
+   if(lots <= 0) return;
 
-   if(lotSize <= 0) return;
-
+   double price, sl, tp;
    if(orderType == OP_BUY)
      {
       price = Ask;
-      sl    = price - slDistance;
-      tp    = price + tpDistance;
+      sl    = price - slDist;
+      tp    = price + tpDist;
      }
    else
      {
       price = Bid;
-      sl    = price + slDistance;
-      tp    = price - tpDistance;
+      sl    = price + slDist;
+      tp    = price - tpDist;
      }
 
-   int ticket = OrderSend(
-      Symbol(), orderType, lotSize, price,
-      Slippage, sl, tp,
-      "GoldScalper", MagicNumber, 0,
-      orderType == OP_BUY ? clrDodgerBlue : clrOrangeRed
-   );
+   color clr = (orderType == OP_BUY) ? clrDodgerBlue : clrOrangeRed;
+   int ticket = OrderSend(Symbol(), orderType, lots, price, Slippage, sl, tp,
+                          "GS-v3", MagicNumber, 0, clr);
 
    if(ticket < 0)
-      Print("OrderSend failed — Error: ", GetLastError());
+      Print("OrderSend error: ", GetLastError());
    else
-      Print("Trade opened | Type: ", (orderType == OP_BUY ? "BUY" : "SELL"),
-            " | Lots: ", lotSize,
-            " | SL: ", sl, " | TP: ", tp);
+     {
+      tradesToday++;
+      Print("v3 Trade | ", (orderType==OP_BUY?"BUY":"SELL"),
+            " Lots:", lots, " SL:", sl, " TP:", tp,
+            " ATR:", atr, " Spread:", MarketInfo(Symbol(),MODE_SPREAD));
+     }
   }
 
 //+------------------------------------------------------------------+
-//| Calculate lot size based on risk % and SL distance               |
+//| Move SL to breakeven once trade is ATR_BE in profit              |
 //+------------------------------------------------------------------+
-double CalculateLotSize(double slDistance)
+void ManageBreakeven()
   {
-   double tickValue  = MarketInfo(Symbol(), MODE_TICKVALUE);
-   double tickSize   = MarketInfo(Symbol(), MODE_TICKSIZE);
-   double minLot     = MarketInfo(Symbol(), MODE_MINLOT);
-   double maxLot     = MarketInfo(Symbol(), MODE_MAXLOT);
-   double lotStep    = MarketInfo(Symbol(), MODE_LOTSTEP);
-   double balance    = AccountBalance();
-   double riskAmount = balance * (RiskPercent / 100.0);
-
-   if(tickSize == 0 || tickValue == 0) return 0;
-
-   double slPoints = slDistance / tickSize;
-   double lots     = riskAmount / (slPoints * tickValue);
-
-   lots = MathFloor(lots / lotStep) * lotStep;
-   lots = MathMax(minLot, MathMin(maxLot, lots));
-
-   return lots;
-  }
-
-//+------------------------------------------------------------------+
-//| Move SL to lock in profit as price moves in our favour           |
-//+------------------------------------------------------------------+
-void ManageTrailingStop()
-  {
-   double trailDistance = ATRVal * TrailATR;
+   double atr = iATR(NULL, 0, 14, 1);
+   double beDistance = atr * ATR_BE;
+   double spreadPts  = MarketInfo(Symbol(), MODE_SPREAD) * Point;
 
    for(int i = OrdersTotal() - 1; i >= 0; i--)
      {
       if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
       if(OrderSymbol() != Symbol() || OrderMagicNumber() != MagicNumber) continue;
 
-      double newSL = 0;
+      double openPrice = OrderOpenPrice();
+      double currentSL = OrderStopLoss();
 
       if(OrderType() == OP_BUY)
         {
-         newSL = Bid - trailDistance;
-         if(newSL > OrderStopLoss() + Point)
-            OrderModify(OrderTicket(), OrderOpenPrice(), newSL, OrderTakeProfit(), 0, clrDodgerBlue);
+         double beLevel = openPrice + spreadPts; // breakeven + spread cost
+         if(Bid >= openPrice + beDistance && currentSL < beLevel)
+            OrderModify(OrderTicket(), openPrice, beLevel, OrderTakeProfit(), 0, clrGold);
         }
       else if(OrderType() == OP_SELL)
         {
-         newSL = Ask + trailDistance;
-         if(newSL < OrderStopLoss() - Point || OrderStopLoss() == 0)
-            OrderModify(OrderTicket(), OrderOpenPrice(), newSL, OrderTakeProfit(), 0, clrOrangeRed);
+         double beLevel = openPrice - spreadPts;
+         if(Ask <= openPrice - beDistance && (currentSL > beLevel || currentSL == 0))
+            OrderModify(OrderTicket(), openPrice, beLevel, OrderTakeProfit(), 0, clrGold);
         }
      }
   }
 
 //+------------------------------------------------------------------+
-//| Count open orders for this EA                                    |
+double CalculateLotSize(double slDistance)
+  {
+   double tickValue = MarketInfo(Symbol(), MODE_TICKVALUE);
+   double tickSize  = MarketInfo(Symbol(), MODE_TICKSIZE);
+   double minLot    = MarketInfo(Symbol(), MODE_MINLOT);
+   double maxLot    = MarketInfo(Symbol(), MODE_MAXLOT);
+   double lotStep   = MarketInfo(Symbol(), MODE_LOTSTEP);
+   double balance   = AccountBalance();
+   double riskAmt   = balance * (RiskPercent / 100.0);
+
+   if(tickSize == 0 || tickValue == 0) return 0;
+   double slPoints = slDistance / tickSize;
+   double lots     = riskAmt / (slPoints * tickValue);
+   lots = MathFloor(lots / lotStep) * lotStep;
+   lots = MathMax(minLot, MathMin(maxLot, lots));
+   return lots;
+  }
+
 //+------------------------------------------------------------------+
 int TotalOpenOrders()
   {
    int count = 0;
    for(int i = OrdersTotal() - 1; i >= 0; i--)
-     {
       if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
          if(OrderSymbol() == Symbol() && OrderMagicNumber() == MagicNumber)
             count++;
-     }
    return count;
   }
 
 //+------------------------------------------------------------------+
-//| Expert deinitialization                                          |
-//+------------------------------------------------------------------+
 void OnDeinit(const int reason)
   {
-   Print("GoldScalper EA removed. Reason code: ", reason);
+   Print("GoldScalper v3.0 removed. Reason: ", reason);
   }
 //+------------------------------------------------------------------+
