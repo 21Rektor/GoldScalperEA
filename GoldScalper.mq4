@@ -45,7 +45,7 @@ input double RSI_SellMax       = 55.0;  // RSI max for sell (not oversold)
 input double ATR_SL            = 1.5;   // SL distance in ATR units
 input double ATR_TP            = 3.0;   // TP distance in ATR units (2:1 RR)
 input double ATR_BE            = 1.0;   // Move to breakeven after X ATR profit
-input int    MaxSpreadPoints   = 30;    // Max spread allowed (points)
+input int    MaxSpreadPoints   = 35;    // Max spread allowed (points) — 35 suits Roboforex Pro 29pt spread
 input int    LondonOpenStart   = 8;     // London session start hour
 input int    LondonOpenEnd     = 10;    // London session end hour
 input int    NYOpenStart       = 13;    // NY session start hour
@@ -140,8 +140,10 @@ void OnTick()
    double totalRange= High[1] - Low[1];
    bool strongCandle = (totalRange > 0 && bodySize / totalRange >= 0.5);
 
-   // Minimum profit potential (must be 3× spread at least)
-   double minTarget = spread * 3 * Point;
+   // Minimum profit potential must be at least 5× spread
+   // At 29pt spread on Roboforex, TP must be > 145pts minimum
+   // M15 ATR is typically 150-300pts so this easily passes during sessions
+   double minTarget = spread * 5 * Point;
    bool worthTrading = (atr * ATR_TP > minTarget);
 
    // ADX confirms trend is strong
