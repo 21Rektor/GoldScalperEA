@@ -1,0 +1,16 @@
+# Compiled MQL4 binaries
+*.ex4
+*.ex5
+
+# MetaTrader logs and temp files
+*.log
+*.hst
+*.fxt
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+*.swp
