@@ -14,18 +14,20 @@
 #property strict
 
 //--- Input parameters
-input double RiskPercent     = 1.0;   // Risk per trade (% of balance)
-input int    FastEMA         = 8;     // Fast EMA period
-input int    SlowEMA         = 21;    // Slow EMA period
-input int    RSI_Period      = 14;    // RSI period
-input double RSI_OB          = 70.0;  // RSI overbought level
-input double RSI_OS          = 30.0;  // RSI oversold level
-input double ATR_Multiplier  = 1.5;   // ATR multiplier for SL
-input double RR_Ratio        = 2.0;   // Risk:Reward ratio for TP
-input int    MaxSpreadPoints = 30;    // Max allowed spread (points)
-input int    SessionStartHour = 7;    // Session open hour (server time)
-input int    SessionEndHour  = 20;    // Session close hour (server time)
-input int    MagicNumber     = 202401;// Unique EA identifier
+input double RiskPercent      = 1.0;   // Risk per trade (% of balance)
+input int    FastEMA          = 8;     // Fast EMA period
+input int    SlowEMA          = 21;    // Slow EMA period
+input int    RSI_Period       = 14;    // RSI period
+input double RSI_OB           = 70.0;  // RSI overbought level
+input double RSI_OS           = 30.0;  // RSI oversold level
+input double ATR_Multiplier   = 1.5;   // ATR multiplier for SL
+input double RR_Ratio         = 2.0;   // Risk:Reward ratio for TP
+input int    MaxSpreadPoints  = 30;    // Max allowed spread (points)
+input int    SessionStartHour = 7;     // Session open hour (server time)
+input int    SessionEndHour   = 20;    // Session close hour (server time)
+input int    MagicNumber      = 202401;// Unique EA identifier
+input bool   UseTrailingStop  = true;  // Enable trailing stop
+input double TrailATR         = 1.0;   // Trailing stop distance (ATR units)
 
 //--- Global variables
 double FastEMAVal, SlowEMAVal, PrevFastEMA, PrevSlowEMA;
@@ -80,6 +82,9 @@ void OnTick()
    // --- RSI filter ---
    bool rsiBuyOK  = (RSIVal > RSI_OS && RSIVal < RSI_OB); // not overbought
    bool rsiSellOK = (RSIVal < RSI_OB && RSIVal > RSI_OS); // not oversold
+
+   // --- Trailing stop management ---
+   if(UseTrailingStop) ManageTrailingStop();
 
    // --- No trade if already in position ---
    if(TotalOpenOrders() > 0) return;
@@ -153,6 +158,35 @@ double CalculateLotSize(double slDistance)
    lots = MathMax(minLot, MathMin(maxLot, lots));
 
    return lots;
+  }
+
+//+------------------------------------------------------------------+
+//| Move SL to lock in profit as price moves in our favour           |
+//+------------------------------------------------------------------+
+void ManageTrailingStop()
+  {
+   double trailDistance = ATRVal * TrailATR;
+
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+      if(OrderSymbol() != Symbol() || OrderMagicNumber() != MagicNumber) continue;
+
+      double newSL = 0;
+
+      if(OrderType() == OP_BUY)
+        {
+         newSL = Bid - trailDistance;
+         if(newSL > OrderStopLoss() + Point)
+            OrderModify(OrderTicket(), OrderOpenPrice(), newSL, OrderTakeProfit(), 0, clrDodgerBlue);
+        }
+      else if(OrderType() == OP_SELL)
+        {
+         newSL = Ask + trailDistance;
+         if(newSL < OrderStopLoss() - Point || OrderStopLoss() == 0)
+            OrderModify(OrderTicket(), OrderOpenPrice(), newSL, OrderTakeProfit(), 0, clrOrangeRed);
+        }
+     }
   }
 
 //+------------------------------------------------------------------+
