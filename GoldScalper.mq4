@@ -233,13 +233,15 @@ void ManageBreakeven()
         {
          double beLevel = openPrice + spreadPts; // breakeven + spread cost
          if(Bid >= openPrice + beDistance && currentSL < beLevel)
-            OrderModify(OrderTicket(), openPrice, beLevel, OrderTakeProfit(), 0, clrGold);
+            if(!OrderModify(OrderTicket(), openPrice, beLevel, OrderTakeProfit(), 0, clrGold))
+               Print("Breakeven modify failed (BUY) — Error: ", GetLastError());
         }
       else if(OrderType() == OP_SELL)
         {
          double beLevel = openPrice - spreadPts;
          if(Ask <= openPrice - beDistance && (currentSL > beLevel || currentSL == 0))
-            OrderModify(OrderTicket(), openPrice, beLevel, OrderTakeProfit(), 0, clrGold);
+            if(!OrderModify(OrderTicket(), openPrice, beLevel, OrderTakeProfit(), 0, clrGold))
+               Print("Breakeven modify failed (SELL) — Error: ", GetLastError());
         }
      }
   }
